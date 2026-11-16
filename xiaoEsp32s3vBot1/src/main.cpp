@@ -1,48 +1,109 @@
-#include "config1.h"
+#include <Arduino.h>
+#include "secrets.h"
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_sleep.h>
+#include <esp_heap_caps.h>
 #include <WebSocketsClient.h>
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 #include <driver/i2s.h>
 
-// --- Pin Assignments & Configs ---
-// INMP441 MIC
-#define I2S_MIC_SCK  6
-#define I2S_MIC_WS   5
-#define I2S_MIC_SD   4
-#define I2S_MIC_PORT I2S_NUM_0
-#define SAMPLE_RATE 16000
-#define BUFFER_SIZE 512
+// Fallback aliases if user header only defines ssid/password
+#ifndef WIFI_SSID
+#define WIFI_SSID ssid
+#endif
+#ifndef WIFI_PASSWORD
+#define WIFI_PASSWORD password
+#endif
 
-// Amplifier pin definitions
-// --- Pin Assignments for Speaker (xiaogpt pins on I2S Port 1) ---
-#define I2S_SPEAKER_PORT I2S_NUM_1  // <-- Using Port 1 to avoid conflict with mic
-#define I2S_SPEAKER_SCK  8          // Serial Clock (BCK / BCLK)
-#define I2S_SPEAKER_WS   7          // Word Select (LRC / LRCK)
-#define I2S_SPEAKER_SD   9          // Serial Data (DIN)
+// =============================================================================
+// PIN ASSIGNMENTS & HARDWARE CONFIG (Canonical XIAO ESP32-S3 Mapping)
+// =============================================================================
+// INMP441 Microphone (I2S_NUM_0)
+#define I2S_MIC_SCK      6
+#define I2S_MIC_WS       5
+#define I2S_MIC_SD       4
+#define I2S_MIC_PORT     I2S_NUM_0
+#define SAMPLE_RATE      16000
+#define BUFFER_SIZE      512
 
-// --- Globals ---
+// MAX98357A Speaker Amplifier (I2S_NUM_1)
+#define I2S_SPEAKER_PORT I2S_NUM_1
+#define I2S_SPEAKER_SCK  8
+#define I2S_SPEAKER_WS   7
+#define I2S_SPEAKER_SD   9
+#define DEFAULT_TTS_RATE 24000
+
+// Stream & Buffer Constants
+#define HTTP_STREAM_BUF_SIZE 4096
+#define HTTP_IDLE_TIMEOUT_MS 2500
+
+// =============================================================================
+// STATE MACHINE & GLOBAL INSTANCES
+// =============================================================================
+enum BotState {
+  STATE_BOOT,
+  STATE_LISTENING,
+  STATE_PROCESSING_LLM,
+  STATE_SPEAKING
+};
+
+volatile BotState currentState = STATE_BOOT;
+volatile bool isSpeaking = false;
+
+// Invariant 4 Rule 2: Single shared global WiFiClientSecure instance for HTTPS
+// (Deepgram WSS is paused/disconnected before opening Groq HTTPS sessions)
+WiFiClientSecure tlsClient;
 WebSocketsClient webSocket;
-String interimTranscript = "";       // most recent partial
+bool wsActive = false;
+bool bootGreetingPending = true;
+
+// Transcript accumulators
+String interimTranscript = "";
 String committedTranscript = "";
-String interimBuffer = "";
-bool DEBUG_FINALS = true;  // Toggle debug printing for is_final chunks
+String pendingPrompt = "";
+volatile bool hasPendingPrompt = false;
+volatile bool pendingGoodbye = false;
+
+bool DEBUG_FINALS = true;
 unsigned long queryEndTime = 0;
 bool awaitingGroqResponse = false;
 int chunkCount = 1;
-bool isSpeaking = false; // Flag to prevent mic from listening to the speaker
 
-// --- State flags ---
-bool asleep = false;   // true = Deepgram stream closed, waiting for wake word
+// Invariant 4 Rule 1: Octal PSRAM Buffers
+uint8_t* psramHttpBuf  = nullptr; // 4096-byte HTTP stream read buffer (+1 carry slot)
+int32_t* psramMicRaw32 = nullptr; // 512 x 32-bit I2S mic capture buffer
+int16_t* psramMicPcm16 = nullptr; // 512 x 16-bit PCM outbound frame buffer
+
+// Custom ArduinoJson allocator using Octal PSRAM when available
+struct SpiRamAllocator : ArduinoJson::Allocator {
+  void* allocate(size_t size) override {
+    void* p = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : malloc(size);
+  }
+  void deallocate(void* pointer) override {
+    free(pointer);
+  }
+  void* reallocate(void* ptr, size_t new_size) override {
+    void* p = heap_caps_realloc(ptr, new_size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    return p ? p : realloc(ptr, new_size);
+  }
+};
+SpiRamAllocator psramJsonAllocator;
 
 // =============================================================================
 // FORWARD DECLARATIONS
 // =============================================================================
-void playTTS(String text);
-void sendToGroq(String prompt);  // Optional but good practice
+void playTTS(const String& text);
+void sendToGroq(String prompt);
+void pauseDeepgramWSS();
+void resumeDeepgramWSS();
+void flushMicDMA();
 
-//"/v1/listen?encoding=linear16&sample_rate=16000&channels=1&interim_results=true&smart_format=true&endpointing=500&utterance_end_ms=2000&model=nova-3&punctuate=true";
+// =============================================================================
+// DEEPGRAM CONFIGURATION
+// =============================================================================
 struct DeepgramConfig {
   const char* host = "api.deepgram.com";
   int port = 443;
@@ -57,7 +118,6 @@ struct DeepgramConfig {
   int utterance_end_ms = 3000;
 };
 
-// Global instance
 DeepgramConfig dg;
 
 String buildDeepgramURL() {
@@ -90,7 +150,9 @@ String buildStartRequest() {
   return json;
 }
 
-// Conversation history
+// =============================================================================
+// CONVERSATION HISTORY & PERSONA PROMPTS
+// =============================================================================
 struct Message {
   String role;
   String content;
@@ -100,7 +162,6 @@ struct Message {
 Message history[MAX_HISTORY];
 int historyCount = 0;
 
-// System prompt (always re-sent)
 const char* SYSTEM_PROMPT =
 //  "You are Max Headroom, the iconic 1980s AI TV host."
 //  "Your personality is sarcastic, egocentric, witty, and slightly nonsensical."
@@ -118,555 +179,553 @@ const char* SYSTEM_PROMPT =
   "You are working over an audio link, so your responses are optimised for being heard rather than read. "
   "Favor concise, direct replies with a touch of dry wit.";
 
-// Add a message to history and prune if needed
-void addToHistory(String role, String content) {
+void addToHistory(const String& role, const String& content) {
   if (historyCount < MAX_HISTORY) {
-    // Still room in history
     history[historyCount].role = role;
     history[historyCount].content = content;
     historyCount++;
   } else {
-    // Shift everything left (drop oldest)
     for (int i = 1; i < MAX_HISTORY; i++) {
       history[i - 1] = history[i];
     }
-    // Insert new message at the end
     history[MAX_HISTORY - 1].role = role;
     history[MAX_HISTORY - 1].content = content;
   }
 }
 
-// --- LLM Query Function ---
+// =============================================================================
+// PSRAM BUFFER ALLOCATION (INVARIANT 4 RULE 1)
+// =============================================================================
+static void* allocPSRAMOrSRAM(size_t size) {
+  void* ptr = nullptr;
+  if (psramFound()) {
+    ptr = ps_malloc(size);
+    if (!ptr) {
+      ptr = heap_caps_malloc(size, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    }
+  }
+  if (!ptr) {
+    ptr = malloc(size);
+  }
+  return ptr;
+}
+
+bool initPSRAMBuffers() {
+  // Allocate +2 bytes headroom for 1-byte carry prepend
+  psramHttpBuf  = (uint8_t*)allocPSRAMOrSRAM(HTTP_STREAM_BUF_SIZE + 2);
+  psramMicRaw32 = (int32_t*)allocPSRAMOrSRAM(BUFFER_SIZE * sizeof(int32_t));
+  psramMicPcm16 = (int16_t*)allocPSRAMOrSRAM(BUFFER_SIZE * sizeof(int16_t));
+
+  Serial.printf("[MEM] PSRAM found: %s | Free PSRAM: %u bytes | Free Internal SRAM: %u bytes\n",
+                psramFound() ? "YES" : "NO",
+                ESP.getFreePsram(),
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+
+  return (psramHttpBuf != nullptr && psramMicRaw32 != nullptr && psramMicPcm16 != nullptr);
+}
+
+// =============================================================================
+// TLS SESSION SEQUENCING (INVARIANT 4 RULE 2) & HALF-DUPLEX MIC GATING (INVARIANT 5)
+// =============================================================================
+void pauseDeepgramWSS() {
+  if (wsActive) {
+    Serial.println("[TLS] Pausing Deepgram WSS before Groq HTTPS session...");
+    webSocket.disconnect();
+    wsActive = false;
+    // Allow mbedTLS socket teardown to free ~40 KB contiguous internal SRAM
+    for (int i = 0; i < 10; i++) {
+      webSocket.loop();
+      delay(10);
+    }
+  }
+}
+
+void resumeDeepgramWSS() {
+  if (!wsActive && WiFi.status() == WL_CONNECTED) {
+    Serial.printf("[TLS] Resuming Deepgram WSS (Free Internal Heap: %u bytes)...\n",
+                  heap_caps_get_free_size(MALLOC_CAP_INTERNAL));
+    String url = buildDeepgramURL();
+    webSocket.beginSSL(dg.host, dg.port, url.c_str());
+    webSocket.setExtraHeaders((String("Authorization: Token ") + DEEPGRAM_API_KEY).c_str());
+    wsActive = true;
+  }
+}
+
+void flushMicDMA() {
+  if (!psramMicRaw32) return;
+  size_t bytes_read = 0;
+  // Drain stale DMA buffers so the mic never transcribes residual room echo
+  for (int i = 0; i < 6; i++) {
+    i2s_read(I2S_MIC_PORT, (void*)psramMicRaw32, BUFFER_SIZE * sizeof(int32_t), &bytes_read, 0);
+  }
+}
+
+// =============================================================================
+// PCM SAMPLE PROCESSING + I2S WRITE (INVARIANT 1: 2-BYTE CARRY ALIGNMENT)
+// =============================================================================
+static void writeAlignedPCM(uint8_t* data, size_t len, uint8_t& carryByte, bool& hasCarry,
+                            float amplification, size_t& totalPcmBytesWritten) {
+  if (len == 0) return;
+
+  // If we have a carried byte from the previous chunk, process the 2-byte boundary pair first
+  size_t offset = 0;
+  if (hasCarry) {
+    uint8_t pair[2] = { carryByte, data[0] };
+    int16_t* samplePtr = (int16_t*)pair;
+    float amplified = (float)(*samplePtr) * amplification;
+    if (amplified > 32767.0f) amplified = 32767.0f;
+    else if (amplified < -32768.0f) amplified = -32768.0f;
+    *samplePtr = (int16_t)amplified;
+
+    size_t written = 0;
+    i2s_write(I2S_SPEAKER_PORT, pair, 2, &written, portMAX_DELAY);
+    totalPcmBytesWritten += written;
+
+    hasCarry = false;
+    offset = 1;
+  }
+
+  size_t remaining = len - offset;
+  if (remaining == 0) return;
+
+  // Hold back the final byte if remaining byte count is odd
+  if (remaining & 1) {
+    carryByte = data[offset + remaining - 1];
+    hasCarry = true;
+    remaining &= ~((size_t)1);
+  }
+
+  if (remaining == 0) return;
+
+  uint8_t* alignedPtr = data + offset;
+  int16_t* samples = (int16_t*)alignedPtr;
+  size_t sampleCount = remaining / 2;
+
+  for (size_t i = 0; i < sampleCount; i++) {
+    float amplifiedSample = (float)samples[i] * amplification;
+    if (amplifiedSample > 32767.0f) {
+      amplifiedSample = 32767.0f;
+    } else if (amplifiedSample < -32768.0f) {
+      amplifiedSample = -32768.0f;
+    }
+    samples[i] = (int16_t)amplifiedSample;
+  }
+
+  size_t bytes_written = 0;
+  esp_err_t err = i2s_write(I2S_SPEAKER_PORT, alignedPtr, remaining, &bytes_written, portMAX_DELAY);
+  if (err == ESP_OK) {
+    totalPcmBytesWritten += bytes_written;
+  } else {
+    Serial.printf("[I2S] i2s_write error: %d\n", err);
+  }
+}
+
+// =============================================================================
+// TTS PLAYBACK FUNCTION (INVARIANTS 1, 2, 3, 4, 5)
+// =============================================================================
+enum WavParseState {
+  WAV_SCAN_SUBCHUNKS,
+  WAV_READ_FMT_SIZE,
+  WAV_READ_FMT_BODY,
+  WAV_SKIP_DATA_SIZE,
+  WAV_STREAMING_PCM
+};
+
+void playTTS(const String& text) {
+  if (text.length() == 0) return;
+
+  // Invariant 5: Stop/gate mic capture before starting TTS playback
+  isSpeaking = true;
+  currentState = STATE_SPEAKING;
+  i2s_stop(I2S_MIC_PORT);
+
+  // Invariant 4 Rule 2: Ensure Deepgram WSS is disconnected before HTTPS
+  pauseDeepgramWSS();
+
+  Serial.println("[TTS] Starting Groq TTS playback...");
+  Serial.printf("[MEM Before TTS] Internal Heap: %u bytes | PSRAM: %u bytes\n",
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL), ESP.getFreePsram());
+
+  tlsClient.stop();
+  tlsClient.setInsecure();
+
+  HTTPClient http;
+  http.begin(tlsClient, "https://api.groq.com/openai/v1/audio/speech");
+  http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
+  http.addHeader("Content-Type", "application/json");
+  http.setTimeout(30000);
+
+  JsonDocument doc(&psramJsonAllocator);
+  doc["model"] = "playai-tts";
+  doc["input"] = text;
+  doc["voice"] = "Atlas-PlayAI";
+  doc["response_format"] = "wav";
+
+  String requestBody;
+  serializeJson(doc, requestBody);
+  Serial.printf("[TTS] Request payload size: %u bytes\n", requestBody.length());
+
+  int httpCode = http.POST(requestBody);
+
+  if (httpCode == HTTP_CODE_OK) {
+    WiFiClient* stream = http.getStreamPtr();
+
+    // Invariant 2: Stateful WAV "fmt " + "data" Subchunk Scanner (No 44-Byte Assumption)
+    WavParseState wavState = WAV_SCAN_SUBCHUNKS;
+    uint8_t window[4] = {0, 0, 0, 0};
+    uint8_t sizeBuf[4] = {0, 0, 0, 0};
+    uint8_t sizeBytesRead = 0;
+    uint32_t fmtChunkSize = 0;
+    uint32_t fmtBytesRead = 0;
+    uint8_t fmtBody[16];
+    uint8_t dataSizeSkipped = 0;
+
+    // Invariant 1: 2-Byte Carry Alignment state
+    uint8_t carryByte = 0;
+    bool hasCarry = false;
+    const float amplification = 3.0f;
+
+    unsigned long startTime = millis();
+    unsigned long lastByteTime = millis();
+    size_t totalStreamBytes = 0;
+    size_t totalPcmBytesWritten = 0;
+
+    // Invariant 3: Complete HTTP Stream Consumption across TCP chunk gaps
+    while (http.connected() || (stream && stream->available() > 0)) {
+      int avail = stream ? stream->available() : 0;
+      if (avail > 0) {
+        size_t toRead = (size_t)avail;
+        if (toRead > HTTP_STREAM_BUF_SIZE) {
+          toRead = HTTP_STREAM_BUF_SIZE;
+        }
+        int bytesRead = stream->read(psramHttpBuf, toRead);
+        if (bytesRead > 0) {
+          lastByteTime = millis();
+          totalStreamBytes += (size_t)bytesRead;
+
+          if (wavState == WAV_STREAMING_PCM) {
+            writeAlignedPCM(psramHttpBuf, (size_t)bytesRead, carryByte, hasCarry,
+                            amplification, totalPcmBytesWritten);
+          } else {
+            // Process header bytes statefully until WAV_STREAMING_PCM is reached
+            int idx = 0;
+            while (idx < bytesRead && wavState != WAV_STREAMING_PCM) {
+              uint8_t b = psramHttpBuf[idx++];
+
+              switch (wavState) {
+                case WAV_SCAN_SUBCHUNKS:
+                  window[0] = window[1];
+                  window[1] = window[2];
+                  window[2] = window[3];
+                  window[3] = b;
+
+                  // Match "fmt " (0x66, 0x6D, 0x74, 0x20)
+                  if (window[0] == 0x66 && window[1] == 0x6D &&
+                      window[2] == 0x74 && window[3] == 0x20) {
+                    sizeBytesRead = 0;
+                    wavState = WAV_READ_FMT_SIZE;
+                  }
+                  // Match "data" (0x64, 0x61, 0x74, 0x61)
+                  else if (window[0] == 0x64 && window[1] == 0x61 &&
+                           window[2] == 0x74 && window[3] == 0x61) {
+                    dataSizeSkipped = 0;
+                    wavState = WAV_SKIP_DATA_SIZE;
+                  }
+                  break;
+
+                case WAV_READ_FMT_SIZE:
+                  sizeBuf[sizeBytesRead++] = b;
+                  if (sizeBytesRead == 4) {
+                    fmtChunkSize = (uint32_t)sizeBuf[0] |
+                                   ((uint32_t)sizeBuf[1] << 8) |
+                                   ((uint32_t)sizeBuf[2] << 16) |
+                                   ((uint32_t)sizeBuf[3] << 24);
+                    fmtBytesRead = 0;
+                    wavState = (fmtChunkSize > 0) ? WAV_READ_FMT_BODY : WAV_SCAN_SUBCHUNKS;
+                  }
+                  break;
+
+                case WAV_READ_FMT_BODY:
+                  if (fmtBytesRead < sizeof(fmtBody)) {
+                    fmtBody[fmtBytesRead] = b;
+                  }
+                  fmtBytesRead++;
+                  if (fmtBytesRead >= fmtChunkSize) {
+                    if (fmtChunkSize >= 16) {
+                      uint16_t numChannels = (uint16_t)fmtBody[2] | ((uint16_t)fmtBody[3] << 8);
+                      uint32_t sampleRate  = (uint32_t)fmtBody[4] |
+                                             ((uint32_t)fmtBody[5] << 8) |
+                                             ((uint32_t)fmtBody[6] << 16) |
+                                             ((uint32_t)fmtBody[7] << 24);
+                      uint16_t bitsPerSample = (uint16_t)fmtBody[14] | ((uint16_t)fmtBody[15] << 8);
+                      Serial.printf("[WAV fmt] Rate=%u Hz, Channels=%u, Bits=%u\n",
+                                    sampleRate, numChannels, bitsPerSample);
+                      if (sampleRate >= 8000 && sampleRate <= 48000 && bitsPerSample == 16) {
+                        i2s_set_clk(I2S_SPEAKER_PORT,
+                                    sampleRate,
+                                    I2S_BITS_PER_SAMPLE_16BIT,
+                                    (numChannels == 2) ? I2S_CHANNEL_STEREO : I2S_CHANNEL_MONO);
+                      }
+                    }
+                    memset(window, 0, sizeof(window));
+                    wavState = WAV_SCAN_SUBCHUNKS;
+                  }
+                  break;
+
+                case WAV_SKIP_DATA_SIZE:
+                  dataSizeSkipped++;
+                  if (dataSizeSkipped >= 4) {
+                    Serial.printf("[WAV data] Located PCM payload at byte offset %u\n",
+                                  (unsigned int)(totalStreamBytes - (bytesRead - idx)));
+                    wavState = WAV_STREAMING_PCM;
+                  }
+                  break;
+
+                case WAV_STREAMING_PCM:
+                  break;
+              }
+            }
+
+            // Stream any remaining PCM bytes in this first chunk after "data" + size
+            if (wavState == WAV_STREAMING_PCM && idx < bytesRead) {
+              writeAlignedPCM(psramHttpBuf + idx, (size_t)(bytesRead - idx),
+                              carryByte, hasCarry, amplification, totalPcmBytesWritten);
+            }
+          }
+        }
+      } else {
+        // No bytes available right now; check idle timeout
+        if (millis() - lastByteTime > HTTP_IDLE_TIMEOUT_MS) {
+          Serial.println("[TTS] Stream idle timeout reached.");
+          break;
+        }
+        delay(2);
+      }
+      yield();
+    }
+
+    unsigned long playTime = millis() - startTime;
+    Serial.printf("[TTS] Playback complete: %u PCM bytes written (%u total HTTP bytes) in %lu ms\n",
+                  (unsigned int)totalPcmBytesWritten, (unsigned int)totalStreamBytes, playTime);
+  } else {
+    Serial.printf("[TTS] ERROR: Groq TTS request failed, HTTP code: %d\n", httpCode);
+    String errBody = http.getString();
+    if (errBody.length() > 0) {
+      Serial.println(errBody);
+    }
+  }
+
+  http.end();
+  tlsClient.stop();
+
+  // Invariant 5: Zero speaker DMA buffer, restart & flush mic DMA, return to LISTENING
+  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
+  delay(30);
+  i2s_start(I2S_MIC_PORT);
+  flushMicDMA();
+
+  Serial.printf("[MEM After TTS] Internal Heap: %u bytes | PSRAM: %u bytes\n",
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL), ESP.getFreePsram());
+
+  isSpeaking = false;
+  currentState = STATE_LISTENING;
+}
+
+// =============================================================================
+// GROQ LLM QUERY FUNCTION (INVARIANT 4: SINGLE-TLS SEQUENCING & PSRAM JSON)
+// =============================================================================
 void sendToGroq(String prompt) {
   prompt.trim();
   if (prompt.length() < 2) return;
 
-  // Store user's message in history
+  currentState = STATE_PROCESSING_LLM;
+
+  // Invariant 4 Rule 2: Disconnect Deepgram WSS before opening Groq HTTPS session
+  pauseDeepgramWSS();
+
   addToHistory("user", prompt);
 
-  //Serial.println("\n--------------------------");
   Serial.print("Sending to Groq: ");
   Serial.println(prompt);
 
+  tlsClient.stop();
+  tlsClient.setInsecure();
+
   HTTPClient http;
-  http.begin("https://api.groq.com/openai/v1/chat/completions");
+  http.begin(tlsClient, "https://api.groq.com/openai/v1/chat/completions");
   http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
   http.addHeader("Content-Type", "application/json");
+  http.setTimeout(15000);
 
-  JsonDocument doc;  doc["model"] = "llama-3.3-70b-versatile";
+  JsonDocument doc(&psramJsonAllocator);
+  doc["model"] = "llama-3.3-70b-versatile";
 
-  // Build messages array
   JsonArray messages = doc["messages"].to<JsonArray>();
 
-  // Always include system prompt
   JsonObject sys = messages.add<JsonObject>();
   sys["role"] = "system";
   sys["content"] = SYSTEM_PROMPT;
 
-  // Add conversation history
   for (int i = 0; i < historyCount; i++) {
     JsonObject msg = messages.add<JsonObject>();
     msg["role"] = history[i].role;
     msg["content"] = history[i].content;
   }
 
-  // Serialize
   String requestBody;
   serializeJson(doc, requestBody);
 
-  // Debug: show heap + history size
-  Serial.printf("[History count=%d, FreeHeap=%d]\n", historyCount, ESP.getFreeHeap());
+  Serial.printf("[LLM] History=%d | Internal Heap=%u bytes | PSRAM=%u bytes\n",
+                historyCount,
+                heap_caps_get_free_size(MALLOC_CAP_INTERNAL),
+                ESP.getFreePsram());
 
-  // Mark that we’re awaiting response
   awaitingGroqResponse = true;
-
   int httpCode = http.POST(requestBody);
+  String assistantReply = "";
 
-  if (httpCode == 200) {
-    // 🚀 Time-to-first-byte check happens right here
+  if (httpCode == HTTP_CODE_OK) {
     if (awaitingGroqResponse) {
       unsigned long elapsed = millis() - queryEndTime;
-      Serial.printf("[End→First Groq Byte latency] %lu ms\n", elapsed);
+      Serial.printf("[End->First Groq Byte latency] %lu ms\n", elapsed);
       awaitingGroqResponse = false;
     }
 
     String payload = http.getString();
-    DynamicJsonDocument responseDoc(16384);
-    deserializeJson(responseDoc, payload);
-    const char* response_text = responseDoc["choices"][0]["message"]["content"];
-
-    Serial.print("Groq Response: ");
-    Serial.println(response_text);
-
-    // Store assistant's reply in history
-    addToHistory("assistant", String(response_text));
-    // Play audio of Groq's response
-    playTTS(String(response_text));
-
+    JsonDocument responseDoc(&psramJsonAllocator);
+    DeserializationError err = deserializeJson(responseDoc, payload);
+    if (!err) {
+      const char* response_text = responseDoc["choices"][0]["message"]["content"];
+      if (response_text && strlen(response_text) > 0) {
+        assistantReply = String(response_text);
+        Serial.print("Groq Response: ");
+        Serial.println(assistantReply);
+        addToHistory("assistant", assistantReply);
+      } else {
+        Serial.println("[LLM] Warning: Empty content in Groq response.");
+      }
+    } else {
+      Serial.printf("[LLM] JSON parse error: %s\n", err.c_str());
+    }
   } else {
-    Serial.printf("Groq request failed, HTTP code: %d\n", httpCode);
+    Serial.printf("[LLM] Groq request failed, HTTP code: %d\n", httpCode);
     Serial.println(http.getString());
   }
 
   http.end();
+  tlsClient.stop();
   Serial.println("--------------------------\n");
-}
 
-// --- TTS Function ---
-
-void playTTS(String text) {
-  isSpeaking = true;
-  Serial.println("Starting Groq TTS playback with amplification...");
-  Serial.printf("[MEM Before TTS] Heap: %d bytes\n", ESP.getFreeHeap());
-
-  HTTPClient http;
-  http.begin("https://api.groq.com/openai/v1/audio/speech");
-  http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
-  http.addHeader("Content-Type", "application/json");
-  http.setTimeout(30000);  // 30 second timeout for long audio
-
-  // FIX: Use JsonDocument instead of DynamicJsonDocument for ArduinoJson 7.x
-  JsonDocument doc;
-  doc["model"] = "playai-tts";
-  doc["input"] = text;
-  doc["voice"] = "Atlas-PlayAI";
-  doc["response_format"] = "wav";
-
-  String requestBody;
-  serializeJson(doc, requestBody);
-
-  Serial.printf("[TTS] Request size: %d bytes\n", requestBody.length());
-
-  int httpCode = http.POST(requestBody);
-
-  if (httpCode == 200) {
-    WiFiClient* stream = http.getStreamPtr();
-    byte header[44];
-    int headerRead = stream->readBytes(header, 44);
-
-    if (headerRead != 44) {
-      Serial.println("ERROR: Could not read WAV header");
-      http.end();
-      isSpeaking = false;
-      return;
-    }
-
-    // Buffer already static - good!
-    static uint8_t buffer[256];  // 256 bytes = 128 samples at 16-bit
-
-    size_t bytes_written = 0;
-    const float amplification = 5.0f;  // Reduced from 10.0f to prevent clipping/distortion
-
-    Serial.println("Playing audio...");
-    unsigned long startTime = millis();
-    size_t totalBytes = 0;
-
-    while (http.connected() && (stream->available() > 0)) {
-      int bytesRead = stream->readBytes(buffer, sizeof(buffer));
-      if (bytesRead > 0) {
-        totalBytes += bytesRead;
-
-        // Only process if we have complete 16-bit samples
-        if (bytesRead % 2 == 0) {
-          int16_t* samples = (int16_t*)buffer;
-          int sampleCount = bytesRead / 2;
-
-          // Apply amplification with clipping protection
-          for (int i = 0; i < sampleCount; i++) {
-            float amplifiedSample = (float)samples[i] * amplification;
-
-            // Clipping protection
-            if (amplifiedSample > 32767.0f) {
-              amplifiedSample = 32767.0f;
-            } else if (amplifiedSample < -32768.0f) {
-              amplifiedSample = -32768.0f;
-            }
-
-            samples[i] = (int16_t)amplifiedSample;
-          }
-        }
-
-        // Write to I2S speaker
-        i2s_write(I2S_SPEAKER_PORT, buffer, bytesRead, &bytes_written, portMAX_DELAY);
-      }
-
-      // CRITICAL: Yield to allow WebSocket/WiFi tasks to run
-      // This prevents stack overflow and watchdog resets
-      yield();
-
-      // Optional: Add small delay for stability
-      delay(1);
-    }
-
-    unsigned long playTime = millis() - startTime;
-    Serial.printf("[TTS] Playback complete: %d bytes in %lu ms\n", totalBytes, playTime);
-
-  } else {
-    Serial.printf("ERROR: Groq TTS request failed, HTTP code: %d\n", httpCode);
-    String response = http.getString();
-    if (response.length() > 0) {
-      Serial.println("Response:");
-      Serial.println(response);
-    }
+  if (assistantReply.length() > 0) {
+    playTTS(assistantReply);
   }
 
-  http.end();
-
-  // Clear any residual audio in the buffer
-  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
-
-  Serial.println("Groq TTS playback finished.");
-  Serial.printf("[MEM After TTS] Heap: %d bytes\n", ESP.getFreeHeap());
-
-  // Small delay to ensure audio is fully cleared
-  delay(50);
-
-  isSpeaking = false;
-}
-/*
-// --- Revert to this simpler playTTS function ---
-void playTTS(String text) {
-  isSpeaking = true;
-  Serial.println("Starting Groq TTS playback...");
-
-  HTTPClient http;
-  http.begin("https://api.groq.com/openai/v1/audio/speech");
-  http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
-  http.addHeader("Content-Type", "application/json");
-
-  DynamicJsonDocument doc(1024);
-  doc["model"] = "playai-tts";
-  doc["input"] = text;
-  doc["voice"] = "Atlas-PlayAI";
-  doc["response_format"] = "wav";
-
-  String requestBody;
-  serializeJson(doc, requestBody);
-  int httpCode = http.POST(requestBody);
-
-  if (httpCode == 200) {
-    WiFiClient* stream = http.getStreamPtr();
-
-    // Skip the 44-byte WAV header
-    byte header[44];
-    stream->readBytes(header, 44);
-
-    uint8_t buffer[BUFFER_SIZE];
-    size_t bytes_written = 0;
-    while (http.connected() && (stream->available() > 0)) {
-      int len = stream->readBytes(buffer, sizeof(buffer));
-      if (len > 0) {
-        i2s_write(I2S_SPEAKER_PORT, buffer, len, &bytes_written, portMAX_DELAY);
-      }
-    }
-  } else {
-    Serial.printf("Groq TTS request failed, HTTP code: %d\n", httpCode);
-    Serial.println(http.getString());
+  if (pendingGoodbye) {
+    Serial.println("Goodbye detected. Disconnecting WiFi and entering deep sleep...");
+    delay(100);
+    pauseDeepgramWSS();
+    WiFi.disconnect(true);
+    delay(200);
+    esp_deep_sleep_start();
   }
 
-  http.end();
-  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
-  Serial.println("Groq TTS playback finished.");
-  isSpeaking = false;
+  // Reconnect Deepgram WSS for next turn
+  resumeDeepgramWSS();
+  currentState = STATE_LISTENING;
 }
-*/
-// --- Replace your playTTS function with this diagnostic version ---
-/*
-void playTTS(String text) {
-  isSpeaking = true;
-  Serial.println("Starting Groq TTS playback...");
 
-  HTTPClient http;
-  http.begin("https://api.groq.com/openai/v1/audio/speech");
-  http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
-  http.addHeader("Content-Type", "application/json");
-
-  DynamicJsonDocument doc(1024);
-  doc["model"] = "playai-tts";
-  doc["input"] = text;
-  doc["voice"] = "Atlas-PlayAI";
-  doc["response_format"] = "wav";
-
-  String requestBody;
-  serializeJson(doc, requestBody);
-  int httpCode = http.POST(requestBody);
-
-  if (httpCode == 200) {
-    // ----> NEW: Check the actual content type of the response <----
-    String contentType = http.header("Content-Type");
-    Serial.printf("[HTTP Response] Content-Type: %s\n", contentType.c_str());
-
-    if (contentType == "audio/wav") {
-      Serial.println("Response is WAV audio. Proceeding to play...");
-      WiFiClient* stream = http.getStreamPtr();
-      byte header[44];
-      stream->readBytes(header, 44);
-
-      // (The rest of the header parsing and i2s_write loop remains the same)
-      uint16_t numChannels = header[22] | (header[23] << 8);
-      uint32_t sampleRate = header[24] | (header[25] << 8) | (header[26] << 16) | (header[27] << 24);
-      uint16_t bitsPerSample = header[34] | (header[35] << 8);
-
-      Serial.println("----------- WAV Header Info -----------");
-      Serial.printf("  - Channels: %u\n", numChannels);
-      Serial.printf("  - Sample Rate: %u Hz\n", sampleRate);
-      Serial.printf("  - Bits Per Sample: %u\n", bitsPerSample);
-      Serial.println("---------------------------------------");
-
-      uint8_t buffer[BUFFER_SIZE];
-      size_t bytes_written = 0;
-      while (http.connected() && (stream->available() > 0)) {
-        int len = stream->readBytes(buffer, sizeof(buffer));
-        if (len > 0) {
-          i2s_write(I2S_SPEAKER_PORT, buffer, len, &bytes_written, portMAX_DELAY);
-        }
-      }
-    } else {
-      // ----> NEW: If not audio, print the response as text to find the error <----
-      Serial.println("!!! ERROR: Expected 'audio/wav' but received something else.");
-      String responseBody = http.getString();
-      Serial.println("----------- Groq Error Response -----------");
-      Serial.println(responseBody);
-      Serial.println("-----------------------------------------");
-    }
-
-  } else {
-    Serial.printf("Groq TTS request failed, HTTP code: %d\n", httpCode);
-    Serial.println(http.getString());
-  }
-
-  http.end();
-  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
-  Serial.println("Groq TTS playback finished.");
-  isSpeaking = false;
-}
-*/
-/*
-void playTTS(String text) {
-  isSpeaking = true;
-  Serial.println("Starting Groq TTS playback...");
-
-  HTTPClient http;
-  http.begin("https://api.groq.com/openai/v1/audio/speech");
-  http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
-  http.addHeader("Content-Type", "application/json");
-
-  DynamicJsonDocument doc(1024);
-  doc["model"] = "playai-tts";
-  doc["input"] = text;
-  doc["voice"] = "Atlas-PlayAI";
-  doc["response_format"] = "wav";
-
-  String requestBody;
-  serializeJson(doc, requestBody);
-  int httpCode = http.POST(requestBody);
-
-  if (httpCode == 200) {
-    WiFiClient* stream = http.getStreamPtr();
-
-    // ----> NEW: Read and inspect the 44-byte WAV header <----
-    byte header[44];
-    stream->readBytes(header, 44);
-
-    // Parse key information from the header (assumes little-endian format)
-    uint16_t numChannels = header[22] | (header[23] << 8);
-    uint32_t sampleRate = header[24] | (header[25] << 8) | (header[26] << 16) | (header[27] << 24);
-    uint16_t bitsPerSample = header[34] | (header[35] << 8);
-
-    Serial.println("----------- WAV Header Info -----------");
-    Serial.printf("  - Channels: %u\n", numChannels);
-    Serial.printf("  - Sample Rate: %u Hz\n", sampleRate);
-    Serial.printf("  - Bits Per Sample: %u\n", bitsPerSample);
-    Serial.println("---------------------------------------");
-
-    // Check if the received format matches our I2S config
-    if (sampleRate != 24000 || bitsPerSample != 16) {
-      Serial.println("!!! WARNING: Audio format does NOT match I2S configuration !!!");
-    } else {
-      Serial.println("Audio format matches I2S configuration. Proceeding to play...");
-    }
-
-    uint8_t buffer[BUFFER_SIZE];
-    size_t bytes_written = 0;
-    while (http.connected() && (stream->available() > 0)) {
-      int len = stream->readBytes(buffer, sizeof(buffer));
-      if (len > 0) {
-        i2s_write(I2S_SPEAKER_PORT, buffer, len, &bytes_written, portMAX_DELAY);
-      }
-    }
-  } else {
-    Serial.printf("Groq TTS request failed, HTTP code: %d\n", httpCode);
-    Serial.println(http.getString());
-  }
-
-  http.end();
-  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
-  Serial.println("Groq TTS playback finished.");
-  isSpeaking = false;
-}
-*/
-/*
-void playTTS(String text) {
-  isSpeaking = true; // Signal that the assistant is talking
-  Serial.println("Starting Groq TTS playback...");
-
-  HTTPClient http;
-  http.begin("https://api.groq.com/openai/v1/audio/speech");
-  http.addHeader("Authorization", "Bearer " + String(GROQ_API_KEY));
-  http.addHeader("Content-Type", "application/json");
-
-  DynamicJsonDocument doc(1024);
-  doc["model"] = "playai-tts";
-  doc["input"] = text;
-  doc["voice"] = "Atlas-PlayAI";
-  // ----> CHANGE #1: Request 'wav' instead of 'pcm' <----
-  doc["response_format"] = "wav";
-
-  String requestBody;
-  serializeJson(doc, requestBody);
-
-  int httpCode = http.POST(requestBody);
-
-  if (httpCode == 200) {
-    WiFiClient* stream = http.getStreamPtr();
-
-    // ----> CHANGE #2: Add code to skip the 44-byte WAV header <----
-    // A standard WAV file header is 44 bytes long. We need to read and
-    // discard it before we can start playing the raw audio data.
-    byte header[44];
-    stream->readBytes(header, 44);
-
-    uint8_t buffer[BUFFER_SIZE];
-    size_t bytes_written = 0;
-
-    // The rest of the streaming logic is the same
-    while (http.connected() && (stream->available() > 0)) {
-      int len = stream->readBytes(buffer, sizeof(buffer));
-      if (len > 0) {
-        i2s_write(I2S_SPEAKER_PORT, buffer, len, &bytes_written, portMAX_DELAY);
-      }
-    }
-  } else {
-    Serial.printf("Groq TTS request failed, HTTP code: %d\n", httpCode);
-    Serial.println(http.getString());
-  }
-
-  http.end();
-  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
-  Serial.println("Groq TTS playback finished.");
-  isSpeaking = false;
-}
-*/
-
-// --- WebSocket Event Handler with UtteranceEnd logic ---
-void webSocketEvent(WStype_t type, uint8_t * payload, size_t length) {
+// =============================================================================
+// DEEPGRAM WEBSOCKET EVENT HANDLER
+// =============================================================================
+void webSocketEvent(WStype_t type, uint8_t* payload, size_t length) {
   switch (type) {
     case WStype_DISCONNECTED:
-      Serial.println("WebSocket Disconnected!");
+      Serial.println("[WSS] Deepgram WebSocket Disconnected.");
       break;
 
-    case WStype_CONNECTED:
-      Serial.printf("WebSocket Connected to URL: %s\n", payload);
-
-      // Immediately start Deepgram stream
-      Serial.println("[Sending StartRequest]");
-      {
-        String startReq = buildStartRequest();
+    case WStype_CONNECTED: {
+      Serial.printf("[WSS] Deepgram WebSocket Connected: %s\n", (const char*)payload);
+      Serial.println("[WSS] Sending StartRequest...");
+      String startReq = buildStartRequest();
       webSocket.sendTXT(startReq);
+
+      if (bootGreetingPending) {
+        bootGreetingPending = false;
+        queryEndTime = millis();
+        pendingPrompt = "System boot complete. Please respond with a short greeting like 'I'm here.'";
+        hasPendingPrompt = true;
       }
-      // Send greeting to Groq
-      sendToGroq("System boot complete. Please respond with a short greeting like 'I'm here.'");
       break;
-
-
-case WStype_TEXT: {
-  //Serial.printf("WebSocket TEXT received | FreeHeap=%u\n", ESP.getFreeHeap());
-
-  StaticJsonDocument<4096> doc;
-  DeserializationError err = deserializeJson(doc, payload, length);
-  if (err) {
-    Serial.print("deserializeJson() failed: ");
-    Serial.println(err.c_str());
-    return;
-  }
-
-  const char* message_type = doc["type"];
-  if (!message_type) return;
-
-  bool is_final_utterance = false;
-
-// Deepgram's suggested way of detecting end of query: https://developers.deepgram.com/docs/understanding-end-of-speech-detection
-if (strcmp(message_type, "Results") == 0) {
-  const char* transcript = doc["channel"]["alternatives"][0]["transcript"];
-  bool is_final = doc["is_final"].as<bool>();
-
-  if (transcript && strlen(transcript) > 0) {
-    String current = String(transcript);
-
-    if (is_final) {
-      chunkCount++;
-      committedTranscript += current + " ";
-      interimTranscript = "";
-
-      if (DEBUG_FINALS) {
-        Serial.printf("[chunk=%d] [is_final=TRUE] committed: \"%s\"\n", chunkCount, transcript);
-                      //current.c_str());
-      }
-    } else {
-      interimTranscript = current;
-      if (DEBUG_FINALS) {
-        Serial.printf("[chunk=%d] [is_final=FALSE] interim: \"%s\"\n", chunkCount, transcript);
-                      //interimTranscript.c_str());
-      }
     }
-  }
-}
-else if (strcmp(message_type, "UtteranceEnd") == 0) {
-  Serial.printf("[%lu ms] [UtteranceEnd]\n", millis());
 
-  String final_transcript = committedTranscript;
-  if (interimTranscript.length() > 0) {
-    final_transcript += interimTranscript;
-  }
-
-  final_transcript.trim();
-  Serial.print("Final transcript: ");
-  Serial.println(final_transcript);
-
-  if (final_transcript.length() > 0) {
-      Serial.println("[Forwarding speech to Groq]");
-      Serial.println();
-      Serial.println("--------------------------");
-
-      queryEndTime = millis();
-      awaitingGroqResponse = true;
-
-      sendToGroq(final_transcript);
-      chunkCount = 1;  // reset for next query
-      String normalized = final_transcript;
-      normalized.toLowerCase();
-      normalized.trim();
-      if (normalized.startsWith("goodbye")) {
-        Serial.println("Goodbye detected. Disconnecting websocket. Disconnecting WiFi. Entering deep sleep. Press reset button to reboot...");
-        delay(100);                 // flush serial
-        webSocket.disconnect();     // close Deepgram websocket
-        WiFi.disconnect(true);      // power down Wi-Fi radio
-        delay(200);                 // allow radio to settle
-        esp_deep_sleep_start();
+    case WStype_TEXT: {
+      JsonDocument doc(&psramJsonAllocator);
+      DeserializationError err = deserializeJson(doc, payload, length);
+      if (err) {
+        Serial.printf("[WSS] deserializeJson() failed: %s\n", err.c_str());
+        return;
       }
-  }
 
-  // reset buffers
-  committedTranscript = "";
-  interimTranscript = "";
-}
+      const char* message_type = doc["type"];
+      if (!message_type) return;
 
-  break;
-}
-    break;
+      if (strcmp(message_type, "Results") == 0) {
+        const char* transcript = doc["channel"]["alternatives"][0]["transcript"];
+        bool is_final = doc["is_final"].as<bool>();
+
+        if (transcript && strlen(transcript) > 0) {
+          String current = String(transcript);
+          if (is_final) {
+            chunkCount++;
+            committedTranscript += current + " ";
+            interimTranscript = "";
+            if (DEBUG_FINALS) {
+              Serial.printf("[chunk=%d] [is_final=TRUE] committed: \"%s\"\n", chunkCount, transcript);
+            }
+          } else {
+            interimTranscript = current;
+            if (DEBUG_FINALS) {
+              Serial.printf("[chunk=%d] [is_final=FALSE] interim: \"%s\"\n", chunkCount, transcript);
+            }
+          }
+        }
+      } else if (strcmp(message_type, "UtteranceEnd") == 0) {
+        Serial.printf("[%lu ms] [UtteranceEnd]\n", millis());
+
+        String final_transcript = committedTranscript;
+        if (interimTranscript.length() > 0) {
+          final_transcript += interimTranscript;
+        }
+        final_transcript.trim();
+
+        Serial.print("Final transcript: ");
+        Serial.println(final_transcript);
+
+        if (final_transcript.length() > 0) {
+          Serial.println("[Queueing speech for Groq]");
+          Serial.println("--------------------------");
+          queryEndTime = millis();
+          chunkCount = 1;
+
+          String normalized = final_transcript;
+          normalized.toLowerCase();
+          normalized.trim();
+          if (normalized.startsWith("goodbye")) {
+            pendingGoodbye = true;
+          }
+
+          pendingPrompt = final_transcript;
+          hasPendingPrompt = true;
+        }
+
+        committedTranscript = "";
+        interimTranscript = "";
+      }
+      break;
+    }
 
     case WStype_ERROR:
-      Serial.printf("WebSocket Error: %s\n", payload);
+      Serial.printf("[WSS] WebSocket Error: %s\n", (const char*)payload);
       break;
 
     default:
@@ -674,40 +733,49 @@ else if (strcmp(message_type, "UtteranceEnd") == 0) {
   }
 }
 
-// --- I2S mic configuration function ---
+// =============================================================================
+// I2S MICROPHONE & SPEAKER INITIALIZATION
+// =============================================================================
 void configureI2S() {
   i2s_config_t mic_config = {
-  .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
-  .sample_rate = SAMPLE_RATE,   // 16000 or 48000 works
-  .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,  // <-- FIXED
-  .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-  .communication_format = I2S_COMM_FORMAT_STAND_I2S,
-  .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
-  .dma_buf_count = 8,
-  .dma_buf_len = BUFFER_SIZE,
-  .use_apll = 0,
-  .tx_desc_auto_clear = false,
-  .fixed_mclk = 0
-};
+    .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_RX),
+    .sample_rate = SAMPLE_RATE,
+    .bits_per_sample = I2S_BITS_PER_SAMPLE_32BIT,
+    .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
+    .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
+    .dma_buf_count = 8,
+    .dma_buf_len = BUFFER_SIZE,
+    .use_apll = false,
+    .tx_desc_auto_clear = false,
+    .fixed_mclk = 0
+  };
 
-  i2s_pin_config_t pin_config = { .bck_io_num = I2S_MIC_SCK, .ws_io_num = I2S_MIC_WS, .data_out_num = I2S_PIN_NO_CHANGE, .data_in_num = I2S_MIC_SD };
-  i2s_driver_install(I2S_MIC_PORT, &mic_config, 0, NULL);
-  i2s_set_pin(I2S_MIC_PORT, &pin_config);
+  i2s_pin_config_t pin_config = {
+    .bck_io_num = I2S_MIC_SCK,
+    .ws_io_num = I2S_MIC_WS,
+    .data_out_num = I2S_PIN_NO_CHANGE,
+    .data_in_num = I2S_MIC_SD
+  };
+
+  esp_err_t err = i2s_driver_install(I2S_MIC_PORT, &mic_config, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S MIC] Driver install failed: %d\n", err);
+    return;
+  }
+  err = i2s_set_pin(I2S_MIC_PORT, &pin_config);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S MIC] Pin config failed: %d\n", err);
+  }
 }
 
-// --- I2S speaker configutation function ---
-
 void configureI2S_TX() {
-  // First check if already installed
-  i2s_driver_install(I2S_SPEAKER_PORT, NULL, 0, NULL);
-
-  // This configuration is now aligned with the working xiaogpt project
   i2s_config_t tx_config = {
     .mode = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX),
-    .sample_rate = 24000, // Our TTS audio is 24000 Hz
+    .sample_rate = DEFAULT_TTS_RATE,
     .bits_per_sample = I2S_BITS_PER_SAMPLE_16BIT,
     .channel_format = I2S_CHANNEL_FMT_ONLY_LEFT,
-    .communication_format = I2S_COMM_FORMAT_STAND_I2S, // Fixed deprecated constant
+    .communication_format = I2S_COMM_FORMAT_STAND_I2S,
     .intr_alloc_flags = ESP_INTR_FLAG_LEVEL1,
     .dma_buf_count = 8,
     .dma_buf_len = 512,
@@ -716,59 +784,73 @@ void configureI2S_TX() {
     .fixed_mclk = 0
   };
 
-  // Reconfigure without uninstalling first
-  i2s_driver_install(I2S_SPEAKER_PORT, &tx_config, 0, NULL);
+  esp_err_t err = i2s_driver_install(I2S_SPEAKER_PORT, &tx_config, 0, NULL);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S SPK] Driver install failed: %d\n", err);
+    return;
+  }
 
-  // Set the I2S pins
   i2s_pin_config_t pin_config = {
     .bck_io_num = I2S_SPEAKER_SCK,
     .ws_io_num = I2S_SPEAKER_WS,
     .data_out_num = I2S_SPEAKER_SD,
     .data_in_num = I2S_PIN_NO_CHANGE
   };
-  i2s_set_pin(I2S_SPEAKER_PORT, &pin_config);
 
-  // Set the clock after installation
-  i2s_set_clk(I2S_SPEAKER_PORT, 24000, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  err = i2s_set_pin(I2S_SPEAKER_PORT, &pin_config);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S SPK] Pin config failed: %d\n", err);
+    return;
+  }
 
-  Serial.println("Speaker I2S Configured (No Uninstall).");
+  err = i2s_set_clk(I2S_SPEAKER_PORT, DEFAULT_TTS_RATE, I2S_BITS_PER_SAMPLE_16BIT, I2S_CHANNEL_MONO);
+  if (err != ESP_OK) {
+    Serial.printf("[I2S SPK] Clock config failed: %d\n", err);
+  }
+  i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
+  Serial.println("[I2S SPK] Speaker I2S Configured.");
 }
 
 void playTestTone() {
-  Serial.println("🔊 Playing 440Hz test tone for 2 seconds...");
-
-  const int duration = 2000; // 2 seconds
-  const int sampleRate = 24000;
-  const float frequency = 440.0; // A4 note
+  Serial.println("[TEST] Playing 440Hz test tone for 500ms...");
+  const int duration = 500;
+  const int sampleRate = DEFAULT_TTS_RATE;
+  const float frequency = 440.0f;
 
   int16_t buffer[256];
-  size_t bytes_written;
+  size_t bytes_written = 0;
   unsigned long start = millis();
 
   while (millis() - start < duration) {
     for (int i = 0; i < 256; i++) {
-      float time = (float)(millis() - start + (i * 1000.0 / sampleRate)) / 1000.0;
-      buffer[i] = (int16_t)(sin(2.0 * 3.14159 * frequency * time) * 8000.0);
+      float time = (float)(millis() - start + (i * 1000.0f / sampleRate)) / 1000.0f;
+      buffer[i] = (int16_t)(sinf(2.0f * 3.14159265f * frequency * time) * 6000.0f);
     }
     i2s_write(I2S_SPEAKER_PORT, buffer, sizeof(buffer), &bytes_written, portMAX_DELAY);
   }
 
   i2s_zero_dma_buffer(I2S_SPEAKER_PORT);
-  Serial.println("Test tone finished.");
+  Serial.println("[TEST] Test tone finished.");
 }
 
+// =============================================================================
+// SETUP & MAIN LOOP
+// =============================================================================
 void setup() {
   Serial.begin(115200);
   delay(1000);
-  Serial.println("\n--- Real-Time STT->LLM->TTS Bot ---");
+  Serial.println("\n--- Real-Time STT->LLM->TTS Bot (Track A Hardened) ---");
 
-  // Memory debug
-  Serial.printf("[Initial Heap] %d bytes\n", ESP.getFreeHeap());
+  if (!initPSRAMBuffers()) {
+    Serial.println("FATAL: Failed to allocate audio/HTTP buffers! Halting.");
+    while (true) { delay(1000); }
+  }
 
-  WiFi.begin(ssid, password);
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
   Serial.print("Connecting to Wi-Fi...");
   int wifiTimeout = 0;
-  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 20) {
+  while (WiFi.status() != WL_CONNECTED && wifiTimeout < 30) {
     delay(500);
     Serial.print(".");
     wifiTimeout++;
@@ -784,77 +866,60 @@ void setup() {
   configureI2S();
   Serial.println("I2S Microphone Configured.");
 
-  // Remove i2s_driver_uninstall if it's in configureI2S_TX()
   configureI2S_TX();
-  Serial.println("I2S Speaker Configured.");
-
   playTestTone();
+  flushMicDMA();
 
-  Serial.printf("[Heap before WebSocket] %d bytes\n", ESP.getFreeHeap());
-
-  String url = buildDeepgramURL();
-
-  webSocket.beginSSL(dg.host, dg.port, url.c_str());
-  webSocket.setExtraHeaders((String("Authorization: Token ") + DEEPGRAM_API_KEY).c_str());
   webSocket.onEvent(webSocketEvent);
   webSocket.setReconnectInterval(5000);
-
-  // Enable keep-alive
   webSocket.enableHeartbeat(30000, 3000, 2);
+
+  currentState = STATE_LISTENING;
+  resumeDeepgramWSS();
 }
 
 void loop() {
-  webSocket.loop();
-  static unsigned long lastAudioCheck = 0;
-  if (millis() - lastAudioCheck > 2000) {  // Every 2 seconds
-    // Quick read to check audio levels
-    int32_t testBuffer[64];
-    size_t bytes_read;
-    i2s_read(I2S_MIC_PORT, (void*)testBuffer, sizeof(testBuffer), &bytes_read, 0);
-
-    if (bytes_read > 0) {
-      int samples = bytes_read / 4;
-      long sum = 0;
-      for (int i = 0; i < samples; i++) {
-        int16_t sample = testBuffer[i] >> 11;
-        sum += abs(sample);
-      }
-      float avgLevel = (float)sum / samples;
-      Serial.printf("[MIC] Audio level: %.1f (0=quiet, 100+=speaking)\n", avgLevel);
-    }
-    lastAudioCheck = millis();
+  if (wsActive) {
+    webSocket.loop();
   }
 
-  if (!webSocket.isConnected()) {
+  // Process queued prompt outside WebSocket event callback (single-TLS sequencing)
+  if (hasPendingPrompt) {
+    String promptToRun = pendingPrompt;
+    pendingPrompt = "";
+    hasPendingPrompt = false;
+    sendToGroq(promptToRun);
     return;
   }
 
-  // Only capture audio if not speaking
-  if (!isSpeaking) {
-    static int32_t raw32[BUFFER_SIZE];   // Make static to reduce stack usage
+  // Invariant 5: Only capture mic audio when in LISTENING state and not speaking
+  if (currentState == STATE_LISTENING && !isSpeaking && wsActive && webSocket.isConnected()) {
     size_t bytes_read = 0;
+    esp_err_t err = i2s_read(I2S_MIC_PORT,
+                             (void*)psramMicRaw32,
+                             BUFFER_SIZE * sizeof(int32_t),
+                             &bytes_read,
+                             portMAX_DELAY);
 
-    i2s_read(I2S_MIC_PORT, (void*)raw32, sizeof(raw32), &bytes_read, portMAX_DELAY);
-
-    if (bytes_read > 0) {
-      size_t samples_read = bytes_read / 4; // 4 bytes per 32-bit sample
-      static int16_t pcm16[BUFFER_SIZE];
-
+    if (err == ESP_OK && bytes_read > 0) {
+      size_t samples_read = bytes_read / sizeof(int32_t);
+      long sum = 0;
       for (size_t i = 0; i < samples_read; i++) {
-        pcm16[i] = raw32[i] >> 11;  // Keep this as is for now
+        int16_t sample = (int16_t)(psramMicRaw32[i] >> 11);
+        psramMicPcm16[i] = sample;
+        sum += abs(sample);
       }
 
-      webSocket.sendBIN((uint8_t*)pcm16, samples_read * sizeof(int16_t));
+      static unsigned long lastAudioLog = 0;
+      if (millis() - lastAudioLog > 2000 && samples_read > 0) {
+        float avgLevel = (float)sum / (float)samples_read;
+        Serial.printf("[MIC] Audio level: %.1f (0=quiet, 100+=speaking)\n", avgLevel);
+        lastAudioLog = millis();
+      }
+
+      webSocket.sendBIN((uint8_t*)psramMicPcm16, samples_read * sizeof(int16_t));
     }
   } else {
-    // If speaking, yield to let TTS run smoothly
-    delay(1);
-  }
-
-  // Pet the watchdog periodically
-  static unsigned long lastYield = 0;
-  if (millis() - lastYield > 100) {
-    yield();
-    lastYield = millis();
+    delay(2);
   }
 }

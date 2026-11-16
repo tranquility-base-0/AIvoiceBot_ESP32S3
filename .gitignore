@@ -1,6 +1,27 @@
-
-# Local credentials
+# Local credentials & environment
 secrets.h
+**/secrets.h
 config.h
 config1.h
 config4.h
+**/config*.h
+.env
+**/.env
+
+# Python virtual environments & caches
+.venv/
+**/.venv/
+venv/
+__pycache__/
+**/__pycache__/
+*.pyc
+
+# ONNX / TTS model weights & binaries
+*.onnx
+*.bin
+*.pth
+*.pt
+
+# PlatformIO build artifacts
+.pio/
+**/.pio/

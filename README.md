@@ -1,59 +1,77 @@
 # AIvoiceBot ESP32-S3
 
-**Status: Under construction — experimental prototype**
+**Status: Active dual-track development (Track A Cloud Standalone & Track B Local LAN Bridge)**
 
-AIvoiceBot is an experimental voice-assistant project built around the ESP32-S3. It explores a speech-processing pipeline that combines speech-to-text (STT), a large language model (LLM), and text-to-speech (TTS).
+AIvoiceBot is a voice-assistant platform built around the **Seeed Studio XIAO ESP32-S3** (8 MB Quad SPI Flash, 8 MB Octal PSRAM) using dual I2S buses for `INMP441` microphone capture and `MAX98357A` Class-D speaker playback.
 
-The intended pipeline uses Deepgram for speech recognition and Groq for language generation and speech synthesis, with I2S audio input and output.
+---
 
-## Current projects
+## Repository Architecture
 
-Development is focused on two newer PlatformIO projects for the Seeed XIAO ESP32-S3:
+### Active Development Tracks
 
-- **[`xiaoEsp32s3vBot0/`](xiaoEsp32s3vBot0/)** — an earlier iteration of the newer prototypes.
-- **[`xiaoEsp32s3vBot1/`](xiaoEsp32s3vBot1/)** — a later iteration with additional TTS diagnostics and audio-processing experiments.
+1. **[`xiaoEsp32s3vBot1/`](xiaoEsp32s3vBot1/) — Track A (Standalone Cloud Bot):**
+   - Direct on-chip pipeline: `INMP441` (`16 kHz` PCM) $\rightarrow$ Deepgram Nova-3 WSS STT $\rightarrow$ Groq LLM (`llama-3.3-70b-versatile`) HTTPS $\rightarrow$ Groq PlayAI TTS (`wav`) HTTPS $\rightarrow$ `MAX98357A` (`24 kHz` PCM).
+   - Hardened with all five ESP32-S3 audio and memory invariants: stateful WAV `"fmt "` + `"data"` subchunk scanner, 2-byte carry-buffer PCM sample alignment, complete chunked HTTP stream consumption with idle timeout, Octal PSRAM buffer allocation with single-TLS session sequencing, and half-duplex mic gating + DMA buffer zeroing.
 
-These projects have different dependency versions and implementation details. Treat them as separate experimental snapshots; do not assume that their configurations or behavior are interchangeable.
+2. **[`xiaoEsp32s3vBot2/`](xiaoEsp32s3vBot2/) + [`host_bridge/`](host_bridge/) — Track B (Local LAN Audio Terminal + Host Bridge):**
+   - **`xiaoEsp32s3vBot2/`:** Thin, zero-TLS WebSocket PCM transceiver (`ws://<BRIDGE_HOST>:8765/ws/audio`). Streams `16 kHz` `s16le` mono mic frames in `LISTENING` mode and plays headerless `24 kHz` `s16le` mono TTS frames in `SPEAKING` mode using Octal PSRAM buffering and 2-byte carry alignment.
+   - **`host_bridge/`:** Python FastAPI WebSocket server (`bridge_server.py`) providing pluggable STT (local `faster-whisper` with VAD endpointing or Deepgram proxy), **Groq LLM** (`llama-3.3-70b-versatile` with configurable `OPENAI_BASE_URL`), sentence-streamed **Kokoro-ONNX** TTS (`24000 Hz` `s16le` binary frames), customizable personas ([`host_bridge/personas/system_prompt.txt`](host_bridge/personas/system_prompt.txt)), and an optional Max Headroom glitch/espeak-ng DSP hook (`ENABLE_GLITCH_DSP`).
 
-The intended processing pipeline is:
+### Frozen & Historical Reference Targets
 
-1. Capture microphone audio using I2S.
-2. Transcribe speech through Deepgram.
-3. Generate a response using Groq.
-4. Request synthesized speech from Groq.
-5. Play the audio through the I2S speaker output.
+- **[`xiaoEsp32s3vBot0/`](xiaoEsp32s3vBot0/)** — Frozen earlier baseline snapshot retained for comparison.
+- **[`previousDraft/`](previousDraft/)** — Read-only archive of earlier Arduino `.ino` sketches (`TTStest_xiaoesp32s3_Dgram`, `TTStest_xiaoesp32s3_Groq`, `voicebot_xiaoesp32s3` with initial `<SPIFFS.h>` experiment, and `websocketTest_xiaoesp32s3` where the TARS and Max Headroom persona prompts originated) plus [Troubleshooting_notes.md](Troubleshooting_notes.md).
 
-Reliable end-to-end operation has not yet been fully verified.
+---
 
-## Historical prototypes
+## Hardware & Canonical Pinout
 
-The [`previousDraft/`](previousDraft/) directory contains earlier project folders and their associated README files. These materials are retained for historical reference, comparison, and recovery of useful implementation details.
+* **Board:** Seeed Studio XIAO ESP32-S3 (`seeed_xiao_esp32s3`, `board_build.arduino.memory_type = qio_opi`, `-DBOARD_HAS_PSRAM`)
+* **Microphone (`I2S_NUM_0`):** `INMP441` MEMS Microphone (`16000 Hz`, 32-bit I2S frame shifted `>> 11` to 16-bit mono PCM)
+* **Amplifier (`I2S_NUM_1`):** `MAX98357A` I2S Class-D Amplifier (`24000 Hz` default, 16-bit mono PCM)
 
-The archived prototypes include earlier Deepgram, Groq, text-to-speech, and WebSocket experiments. They are not the primary development targets.
+| I2S Bus | Peripheral | Signal | XIAO ESP32-S3 GPIO | Direction |
+| :--- | :--- | :--- | :--- | :--- |
+| `I2S_NUM_0` | `INMP441` Mic | `SCK` (BCLK) | `GPIO 6` | Output from ESP32 |
+| `I2S_NUM_0` | `INMP441` Mic | `WS` (LRC) | `GPIO 5` | Output from ESP32 |
+| `I2S_NUM_0` | `INMP441` Mic | `SD` (DOUT) | `GPIO 4` | Input to ESP32 (`L/R` tied to `GND`) |
+| `I2S_NUM_1` | `MAX98357A` Amp | `BCLK` | `GPIO 8` | Output from ESP32 |
+| `I2S_NUM_1` | `MAX98357A` Amp | `LRC` (WS) | `GPIO 7` | Output from ESP32 |
+| `I2S_NUM_1` | `MAX98357A` Amp | `DIN` | `GPIO 9` | Output from ESP32 |
 
-## Known areas for investigation
+---
 
-The newer prototypes are still under review. Areas requiring further verification include:
+## Setup & Build Instructions
 
-- **I2S initialization:** check driver installation, pin configuration, clock setup, and error handling.
-- **TTS streaming:** ensure playback consumes the complete HTTP response and handles network delays and short reads correctly.
-- **WAV parsing:** validate the audio format and locate the actual audio-data chunk instead of assuming every WAV header is exactly 44 bytes.
-- **Audio playback:** check I2S write results and assess amplification, clipping, and output quality.
-- **Response validation:** handle HTTP errors, malformed JSON, and unexpected API response structures.
-- **Credentials:** ensure API keys and other secrets remain local and are never committed to version control.
+### 1. Credentials Hygiene
+Never commit real Wi-Fi credentials or API keys.
+* **Track A (`xiaoEsp32s3vBot1`):**
+  ```bash
+  cp xiaoEsp32s3vBot1/include/secrets.example.h xiaoEsp32s3vBot1/include/secrets.h
+  ```
+  Edit `xiaoEsp32s3vBot1/include/secrets.h` with your `WIFI_SSID`, `WIFI_PASSWORD`, `DEEPGRAM_API_KEY`, and `GROQ_API_KEY`.
+* **Track B (`xiaoEsp32s3vBot2` & `host_bridge`):**
+  ```bash
+  cp xiaoEsp32s3vBot2/include/secrets.example.h xiaoEsp32s3vBot2/include/secrets.h
+  cp host_bridge/.env.example host_bridge/.env
+  ```
+  Set `BRIDGE_HOST` in `xiaoEsp32s3vBot2/include/secrets.h` to your host machine's LAN IP, and configure `GROQ_API_KEY` (and optional `DEEPGRAM_API_KEY` / Kokoro model paths) in `host_bridge/.env`.
 
-These are investigation items, not a claim that every listed issue has been reproduced at runtime.
+### 2. Building Firmware (PlatformIO)
+```bash
+# Compile Track A (Standalone Cloud Bot)
+pio run -d xiaoEsp32s3vBot1
 
-## Development
+# Compile Track B (Local LAN WebSocket Audio Terminal)
+pio run -d xiaoEsp32s3vBot2
+```
 
-Development is currently focused on reviewing the newer prototypes, identifying integration issues, and improving the reliability of audio playback.
-
-See [Troubleshooting notes](Troubleshooting_notes.md) for investigation findings, and consult any project-specific notes available alongside the relevant source files.
-
-Build and test the projects independently using their respective PlatformIO configurations. Hardware compatibility, dependency behavior, and end-to-end reliability remain to be verified.
-
-## Disclaimer
-
-This repository is provided for experimentation and development. Reproducing the prototypes may require compatible hardware, API credentials, and access to external services.
-
-Keep API keys and other credentials private. Never commit secrets to version control. This project is not a finished or release-ready application; functionality, reliability, and hardware compatibility may change as development continues.
+### 3. Running the Track B Python Host Bridge
+```bash
+cd host_bridge
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
+uvicorn bridge_server:app --host 0.0.0.0 --port 8765
+```
